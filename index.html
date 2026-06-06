@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>幾何跑酷 - 單機物理原型</title>
+    <title>幾何跑酷 - 多人連線版</title>
     <style>
         body {
             margin: 0;
@@ -31,7 +31,7 @@
 <body>
 
     <div id="ui">
-        <h2>幾何跑酷 (Geometric Parkour) - 單機測試</h2>
+        <h2>幾何跑酷 (Geometric Parkour) - 多人連線版</h2>
         <p>控制方式：方向鍵 <b>← / →</b> 移動，<b>Space / ↑</b> 跳躍</p>
     </div>
 
@@ -59,6 +59,12 @@
 
         // 儲存「其他玩家」的位置資料
         const remotePlayers = {};
+        
+        // 儲存從 MongoDB 傳來的排行榜資料
+        let leaderboardData = [];
+
+        // 計時器變數
+        let startTime = Date.now();
 
         const platforms = [
             { x: 0, y: 400, width: 600, height: 50 },
@@ -71,14 +77,11 @@
         const camera = { x: 0 };
 
         // === WEBSOCKET 連線邏輯 ===
-        // 自動獲取當前網址列的內網 IP
         const serverIP = window.location.hostname || 'localhost'; 
-
-        // 關鍵修正：後端 Python 跑在 8000，所以這裡一定要寫死 :8000
         const ws = new WebSocket(`ws://${serverIP}:8000/ws/${myId}`);
 
         ws.onmessage = (event) => {
-            const data = json = JSON.parse(event.data);
+            const data = JSON.parse(event.data);
             
             // 收到其他玩家的位置更新
             if (data.type === 'sync') {
@@ -87,6 +90,10 @@
             // 收到其他玩家斷線通知
             if (data.type === 'disconnect') {
                 delete remotePlayers[data.id];
+            }
+            // 接收來自 MongoDB 的最新排行榜
+            if (data.type === 'leaderboard_update') {
+                leaderboardData = data.leaderboard;
             }
         };
 
@@ -117,7 +124,7 @@
             }
 
             player.vy += GRAVITY;
-            if (player.vy !== 0) moved = true; // 墜落或跳躍中也算移動
+            if (player.vy !== 0) moved = true; 
 
             // X 軸位移與碰撞
             player.x += player.vx;
@@ -139,12 +146,29 @@
             });
 
             if (player.y > canvas.height) resetPlayer();
-            if (checkCollision(player, goal)) resetPlayer();
+            
+            // 抵達終點判定 (新增計時與發送 MongoDB 邏輯)
+            if (checkCollision(player, goal)) {
+                let endTime = Date.now();
+                let totalTime = ((endTime - startTime) / 1000).toFixed(2);
+                
+                alert(`🎉 你通關了！總共花費了 ${totalTime} 秒！`);
+
+                // 發送成績給後端寫入 MongoDB
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'game_over',
+                        time: parseFloat(totalTime)
+                    }));
+                }
+                
+                resetPlayer();
+                startTime = Date.now(); // 重置自己的計時器
+            }
 
             camera.x = player.x - canvas.width / 3;
             if (camera.x < 0) camera.x = 0;
 
-            // 【核心改動】如果自己有移動，就把最新座標透過 WebSocket 噴給 Server
             if (moved && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                     type: 'update',
@@ -161,6 +185,23 @@
         function render() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+            // 繪製固定的 UI 排行榜 (不隨相機滾動)
+            ctx.fillStyle = "white";
+            ctx.font = "bold 16px sans-serif";
+            ctx.fillText("🏆 內網最速排行榜 (MongoDB)", 20, 100);
+            
+            ctx.font = "14px sans-serif";
+            if (leaderboardData.length === 0) {
+                ctx.fillStyle = "#aaa";
+                ctx.fillText("(暫無紀錄，等候玩家挑戰...)", 20, 125);
+            } else {
+                ctx.fillStyle = "#ffcc00";
+                leaderboardData.forEach((record, index) => {
+                    ctx.fillText(`${index + 1}. ${record.player_id} : ${record.clear_time}秒`, 20, 125 + index * 22);
+                });
+            }
+
+            // 繪製遊戲世界
             ctx.save();
             ctx.translate(-camera.x, 0);
 
@@ -170,7 +211,7 @@
             ctx.fillStyle = goal.color;
             ctx.fillRect(goal.x, goal.y, goal.width, goal.height);
 
-            // 1. 畫「其他玩家」（用橘色區隔）
+            // 1. 畫「其他玩家」（橘色）
             ctx.fillStyle = '#ff9900';
             for (let id in remotePlayers) {
                 let p = remotePlayers[id];
