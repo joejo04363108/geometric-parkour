@@ -1,89 +1,138 @@
 import asyncio
 import json
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 from pymongo import MongoClient
-import datetime
+import time
+from fastapi.middleware.cors import CORSMiddleware  # <-- 1. 引入 CORS 套件
 
 app = FastAPI()
 
-# === 1. 初始化 MongoDB 連線 ===
-# 如果是本機資料庫用 'mongodb://localhost:27017/'
+# === 2. 允許跨域請求 (CORS) 設定 ===
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],             # 允許任何來源（包含你的 localhost:5500 或 內網 IP）
+    allow_credentials=True,
+    allow_methods=["*"],             # 允許所有方法（包含 POST, GET, OPTIONS 等）
+    allow_headers=["*"],             # 允許所有標頭
+)
+
+# 1. MongoDB 初始化
 try:
     client = MongoClient('mongodb://localhost:27017/', serverSelectionTimeoutMS=2000)
-    db = client['geometric_parkour']       # 資料庫名稱
-    rank_collection = db['leaderboard']    # 集合名稱（資料表）
-    # 測試連線
+    db = client['geometric_parkour']
+    users_collection = db['users']
     client.server_info()
     print("MongoDB 連線成功！")
 except Exception as e:
-    print(f"MongoDB 連線失敗，請檢查服務是否開啟。錯誤: {e}")
+    print(f"MongoDB 連線失敗: {e}")
 
-# 儲存連線中的玩家
-active_connections = {}
+# 2. 記憶體房間管理
+# 結構: { room_id: { "host": str, "level": int, "players": { player_id: WebSocket } } }
+rooms = {}
 
-@app.websocket("/ws/{player_id}")
-async def websocket_endpoint(websocket: WebSocket, player_id: str):
+class AuthModel(BaseModel):
+    username: str
+    password: str
+
+# HTTP 註冊與登入 API
+@app.post("/api/register")
+def register(data: AuthModel):
+    if users_collection.find_one({"username": data.username}):
+        return {"success": False, "msg": "帳號已存在"}
+    users_collection.insert_one({"username": data.username, "password": data.password})
+    return {"success": True, "msg": "註冊成功"}
+
+@app.post("/api/login")
+def login(data: AuthModel):
+    user = users_collection.find_one({"username": data.username, "password": data.password})
+    if user:
+        return {"success": True, "msg": "登入成功"}
+    return {"success": False, "msg": "帳號或密碼錯誤"}
+
+
+@app.websocket("/ws/{room_id}/{player_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: str):
     await websocket.accept()
     
-    active_connections[player_id] = {
-        "ws": websocket,
-        "x": 100,
-        "y": 300
-    }
-    print(f"玩家連線成功: {player_id}，目前在線人數: {len(active_connections)}")
+    # 初始化房間
+    if room_id not in rooms:
+        rooms[room_id] = {"host": player_id, "level": 1, "players": {}, "start_time": 0}
+    
+    rooms[room_id]["players"][player_id] = websocket
+    
+    # 廣播房間內最新的玩家名單
+    await broadcast_room_members(room_id)
 
     try:
         while True:
             data = await websocket.receive_text()
             message = json.loads(data)
             
-            # 處理位置更新
-            if message.get("type") == "update":
-                active_connections[player_id]["x"] = message["x"]
-                active_connections[player_id]["y"] = message["y"]
-                
-                payload = {
-                    "type": "sync",
-                    "id": player_id,
-                    "x": message["x"],
-                    "y": message["y"]
-                }
-                for conn_id, conn_data in active_connections.items():
-                    if conn_id != player_id:
-                        await conn_data["ws"].send_text(json.dumps(payload))
+            # 轉發即時遊戲狀態 (座標、血量、機關狀態)
+            if message.get("type") in ["update", "interact"]:
+                message["id"] = player_id
+                for p_id, p_ws in rooms[room_id]["players"].items():
+                    if p_id != player_id:
+                        await p_ws.send_text(json.dumps(message))
             
-            # === 2. 處理玩家通關，寫入 MongoDB ===
+            # 房主切換關卡
+            elif message.get("type") == "change_level":
+                if rooms[room_id]["host"] == player_id:
+                    rooms[room_id]["level"] = message["level"]
+                    await broadcast_to_room(room_id, {"type": "level_changed", "level": message["level"]})
+
+            # 房主開始遊戲
+            elif message.get("type") == "start_game":
+                if rooms[room_id]["host"] == player_id:
+                    rooms[room_id]["start_time"] = time.time()
+                    await broadcast_to_room(room_id, {"type": "game_start"})
+            
+            # 遊戲結束結算 (成功或失敗)
             elif message.get("type") == "game_over":
-                clear_time = message.get("time") # 拿到前端傳來的通關秒數
+                status = message.get("status") # "success" 或 "fail"
+                elapsed = 0
+                if status == "success" and rooms[room_id]["start_time"] > 0:
+                    elapsed = round(time.time() - rooms[room_id]["start_time"], 2)
                 
-                # 準備寫入 MongoDB 的 Document 格式
-                score_data = {
-                    "player_id": player_id,
-                    "clear_time": clear_time,
-                    "date": datetime.datetime.now()
-                }
-                
-                # 寫入資料庫
-                rank_collection.insert_one(score_data)
-                print(f"【資料庫紀錄】玩家 {player_id} 通關！時間: {clear_time} 秒")
-                
-                # 從資料庫撈出前 3 名的最速紀錄 (按時間升序排序)
-                top_scores = list(rank_collection.find({}, {"_id": 0}).sort("clear_time", 1).limit(3))
-                
-                # 廣播排行榜給所有人
-                rank_payload = {
-                    "type": "leaderboard_update",
-                    "leaderboard": top_scores
-                }
-                for conn_data in active_connections.values():
-                    await conn_data["ws"].send_text(json.dumps(rank_payload))
+                await broadcast_to_room(room_id, {
+                    "type": "game_result",
+                    "status": status,
+                    "level": rooms[room_id]["level"],
+                    "time": elapsed
+                })
 
     except WebSocketDisconnect:
-        del active_connections[player_id]
-        print(f"玩家斷線: {player_id}，目前在線人數: {len(active_connections)}")
-        disconnect_payload = {"type": "disconnect", "id": player_id}
-        for conn_data in active_connections.values():
-            await conn_data["ws"].send_text(json.dumps(disconnect_payload))
+        if room_id in rooms and player_id in rooms[room_id]["players"]:
+            del rooms[room_id]["players"][player_id]
+            print(f"玩家 {player_id} 離開房間 {room_id}")
+            
+            if not rooms[room_id]["players"]: # 房間沒人了，清除房間
+                del rooms[room_id]
+            else:
+                # 如果房主離開了，更換房主
+                if rooms[room_id]["host"] == player_id:
+                    rooms[room_id]["host"] = list(rooms[room_id]["players"].keys())[0]
+                await broadcast_room_members(room_id)
+
+async def broadcast_room_members(room_id):
+    if room_id in rooms:
+        members = list(rooms[room_id]["players"].keys())
+        payload = {
+            "type": "room_info",
+            "host": rooms[room_id]["host"],
+            "members": members,
+            "level": rooms[room_id]["level"]
+        }
+        await broadcast_to_room(room_id, payload)
+
+async def broadcast_to_room(room_id, payload):
+    if room_id in rooms:
+        for p_ws in rooms[room_id]["players"].values():
+            try:
+                await p_ws.send_text(json.dumps(payload))
+            except:
+                pass
 
 if __name__ == "__main__":
     import uvicorn
