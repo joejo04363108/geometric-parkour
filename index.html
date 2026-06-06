@@ -3,229 +3,25 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>幾何跑酷 - 多人連線版</title>
+    <title>幾何跑酷 - 模組化連線版</title>
     <style>
         body {
-            margin: 0;
-            padding: 0;
-            background-color: #222;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            overflow: hidden;
-            color: white;
-            font-family: sans-serif;
+            margin: 0; padding: 0; background-color: #222;
+            display: flex; justify-content: center; align-items: center;
+            height: 100vh; overflow: hidden; color: white; font-family: sans-serif;
         }
-        canvas {
-            background-color: #111;
-            box-shadow: 0 0 20px rgba(0,0,0,0.8);
-        }
-        #ui {
-            position: absolute;
-            top: 20px;
-            left: 20px;
-        }
+        canvas { background-color: #111; box-shadow: 0 0 20px rgba(0,0,0,0.8); }
+        #ui { position: absolute; top: 20px; left: 20px; }
     </style>
 </head>
 <body>
 
     <div id="ui">
-        <h2>幾何跑酷 (Geometric Parkour) - 多人連線版</h2>
+        <h2>幾何跑酷 (Geometric Parkour)</h2>
         <p>控制方式：方向鍵 <b>← / →</b> 移動，<b>Space / ↑</b> 跳躍</p>
     </div>
 
     <canvas id="gameCanvas" width="800" height="450"></canvas>
 
-    <script>
-        const canvas = document.getElementById('gameCanvas');
-        const ctx = canvas.getContext('2d');
-
-        const GRAVITY = 0.5;
-        const KEYS = {};
-
-        window.addEventListener('keydown', e => KEYS[e.code] = true);
-        window.addEventListener('keyup', e => KEYS[e.code] = false);
-
-        // 產生一個隨機 ID 代表自己
-        const myId = 'player_' + Math.random().toString(36).substr(2, 9);
-
-        // 自己的玩家物件
-        const player = {
-            x: 100, y: 300, width: 30, height: 30,
-            vx: 0, vy: 0, speed: 5, jumpForce: 12,
-            isGrounded: false, color: '#00ffcc'
-        };
-
-        // 儲存「其他玩家」的位置資料
-        const remotePlayers = {};
-        
-        // 儲存從 MongoDB 傳來的排行榜資料
-        let leaderboardData = [];
-
-        // 計時器變數
-        let startTime = Date.now();
-
-        const platforms = [
-            { x: 0, y: 400, width: 600, height: 50 },
-            { x: 200, y: 300, width: 150, height: 20 },
-            { x: 450, y: 220, width: 150, height: 20 },
-            { x: 700, y: 350, width: 300, height: 100 },
-            { x: 1100, y: 250, width: 200, height: 200 }
-        ];
-        const goal = { x: 1250, y: 200, width: 30, height: 50, color: '#ff3366' };
-        const camera = { x: 0 };
-
-        // === WEBSOCKET 連線邏輯 ===
-        const serverIP = window.location.hostname || 'localhost'; 
-        const ws = new WebSocket(`ws://${serverIP}:8000/ws/${myId}`);
-
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            
-            // 收到其他玩家的位置更新
-            if (data.type === 'sync') {
-                remotePlayers[data.id] = { x: data.x, y: data.y };
-            }
-            // 收到其他玩家斷線通知
-            if (data.type === 'disconnect') {
-                delete remotePlayers[data.id];
-            }
-            // 接收來自 MongoDB 的最新排行榜
-            if (data.type === 'leaderboard_update') {
-                leaderboardData = data.leaderboard;
-            }
-        };
-
-        function checkCollision(rect1, rect2) {
-            return rect1.x < rect2.x + rect2.width &&
-                rect1.x + rect1.width > rect2.x &&
-                rect1.y < rect2.y + rect2.height &&
-                rect1.y + rect1.height > rect2.y;
-        }
-
-        function gameLoop() {
-            update();
-            render();
-            requestAnimationFrame(gameLoop);
-        }
-
-        function update() {
-            let moved = false;
-            
-            if (KEYS['ArrowLeft'] || KEYS['KeyA']) { player.vx = -player.speed; moved = true; }
-            else if (KEYS['ArrowRight'] || KEYS['KeyD']) { player.vx = player.speed; moved = true; }
-            else player.vx = 0;
-
-            if ((KEYS['Space'] || KEYS['ArrowUp'] || KEYS['KeyW']) && player.isGrounded) {
-                player.vy = -player.jumpForce;
-                player.isGrounded = false;
-                moved = true;
-            }
-
-            player.vy += GRAVITY;
-            if (player.vy !== 0) moved = true; 
-
-            // X 軸位移與碰撞
-            player.x += player.vx;
-            platforms.forEach(plat => {
-                if (checkCollision(player, plat)) {
-                    if (player.vx > 0) player.x = plat.x - player.width;
-                    if (player.vx < 0) player.x = plat.x + plat.width;
-                }
-            });
-
-            // Y 軸位移與碰撞
-            player.y += player.vy;
-            player.isGrounded = false;
-            platforms.forEach(plat => {
-                if (checkCollision(player, plat)) {
-                    if (player.vy > 0) { player.y = plat.y - player.height; player.vy = 0; player.isGrounded = true; }
-                    if (player.vy < 0) { player.y = plat.y + plat.height; player.vy = 0; }
-                }
-            });
-
-            if (player.y > canvas.height) resetPlayer();
-            
-            // 抵達終點判定 (新增計時與發送 MongoDB 邏輯)
-            if (checkCollision(player, goal)) {
-                let endTime = Date.now();
-                let totalTime = ((endTime - startTime) / 1000).toFixed(2);
-                
-                alert(`🎉 你通關了！總共花費了 ${totalTime} 秒！`);
-
-                // 發送成績給後端寫入 MongoDB
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({
-                        type: 'game_over',
-                        time: parseFloat(totalTime)
-                    }));
-                }
-                
-                resetPlayer();
-                startTime = Date.now(); // 重置自己的計時器
-            }
-
-            camera.x = player.x - canvas.width / 3;
-            if (camera.x < 0) camera.x = 0;
-
-            if (moved && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    type: 'update',
-                    x: player.x,
-                    y: player.y
-                }));
-            }
-        }
-
-        function resetPlayer() {
-            player.x = 100; player.y = 300; player.vx = 0; player.vy = 0;
-        }
-
-        function render() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-            // 繪製固定的 UI 排行榜 (不隨相機滾動)
-            ctx.fillStyle = "white";
-            ctx.font = "bold 16px sans-serif";
-            ctx.fillText("🏆 內網最速排行榜 (MongoDB)", 20, 100);
-            
-            ctx.font = "14px sans-serif";
-            if (leaderboardData.length === 0) {
-                ctx.fillStyle = "#aaa";
-                ctx.fillText("(暫無紀錄，等候玩家挑戰...)", 20, 125);
-            } else {
-                ctx.fillStyle = "#ffcc00";
-                leaderboardData.forEach((record, index) => {
-                    ctx.fillText(`${index + 1}. ${record.player_id} : ${record.clear_time}秒`, 20, 125 + index * 22);
-                });
-            }
-
-            // 繪製遊戲世界
-            ctx.save();
-            ctx.translate(-camera.x, 0);
-
-            // 畫地圖
-            ctx.fillStyle = '#444';
-            platforms.forEach(plat => ctx.fillRect(plat.x, plat.y, plat.width, plat.height));
-            ctx.fillStyle = goal.color;
-            ctx.fillRect(goal.x, goal.y, goal.width, goal.height);
-
-            // 1. 畫「其他玩家」（橘色）
-            ctx.fillStyle = '#ff9900';
-            for (let id in remotePlayers) {
-                let p = remotePlayers[id];
-                ctx.fillRect(p.x, p.y, player.width, player.height);
-            }
-
-            // 2. 畫「自己」（青色）
-            ctx.fillStyle = player.color;
-            ctx.fillRect(player.x, player.y, player.width, player.height);
-
-            ctx.restore();
-        }
-
-        gameLoop();
-    </script>
+    <script type="module" src="./src/game.js"></script>
 </body>
-</html>
