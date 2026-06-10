@@ -117,6 +117,7 @@ class Game {
             this.doms.btnStart.classList.remove('hidden');
             this.doms.waitMsg.classList.add('hidden');
             this.doms.lvl2Btn.removeAttribute('disabled'); // 房主解鎖關卡選單
+            document.getElementById('lvl3Btn').removeAttribute('disabled');
         } else {
             this.doms.btnStart.classList.add('hidden');
             this.doms.waitMsg.classList.remove('hidden');
@@ -152,9 +153,19 @@ class Game {
             if (data.sw2 !== undefined) this.remoteSwitches2[id] = data.sw2;
         }
         
+        // src/game.js 的 handleRemoteSync 內部
         if (data.type === 'interact') {
             if (data.action === 'item_collected') this.mapMgr.itemDoubleJump.collected = true;
             if (data.action === 'item_dash_collected') this.mapMgr.itemDash.collected = true;
+            if (data.action === 'item_claw_collected') this.mapMgr.itemClaw.collected = true;
+            
+            // 🔥 新增：當接收到別人的平台消失通知，強制將自己畫面上的該平台變不見
+            if (data.action === 'platform_vanished') {
+                if (this.mapMgr.currentLevel === 2 && this.mapMgr.vanishingPlatforms[data.platIndex]) {
+                    this.mapMgr.vanishingPlatforms[data.platIndex].visible = false;
+                    this.mapMgr.vanishingPlatforms[data.platIndex].touchTimer = 0;
+                }
+            }
         }
     }
 
@@ -193,6 +204,8 @@ class Game {
         } else if (this.selectedLevel === 2) {
             mySw1 = this.mapMgr.checkOverlap(lp, this.mapMgr.lvl2_btn1);
             mySw2 = this.mapMgr.checkOverlap(lp, this.mapMgr.lvl2_btn2);
+        } else if (this.selectedLevel === 3) {
+            mySw1 = this.mapMgr.checkOverlap(lp, this.mapMgr.lvl3_btn); // 🔥 第三關按鈕
         }
         
         let globalSw1 = mySw1;
@@ -200,15 +213,27 @@ class Game {
         for (let id in this.remoteSwitches1) if (this.remoteSwitches1[id]) globalSw1 = true;
         for (let id in this.remoteSwitches2) if (this.remoteSwitches2[id]) globalSw2 = true;
 
-        // game.js 裡的 update() 內部修改：
-        this.mapMgr.updateMechanics(globalSw1, globalSw2, lp, 
-            this.playerMgr.remotePlayers, // 🔥 新增傳入遠端玩家清單
+        // 運行地圖機關與傷害
+        this.mapMgr.updateMechanics(
+            globalSw1, globalSw2, lp, this.playerMgr.remotePlayers,
             (evt) => {
                 if(evt.type === 'item_collected') this.networkMgr.send({ type: 'interact', action: 'item_collected' });
                 if(evt.type === 'item_dash_collected') this.networkMgr.send({ type: 'interact', action: 'item_dash_collected' });
+                if(evt.type === 'item_claw_collected') this.networkMgr.send({ type: 'interact', action: 'item_claw_collected' });
+                
+                // 🔥 新增：當本地平台消失，發送 WebSocket 廣播通知所有人
+                if(evt.type === 'item_vanishing_platform') {
+                    this.networkMgr.send({ type: 'interact', action: 'platform_vanished', platIndex: evt.platIndex });
+                }
+            },
+            () => {
+                this.playerMgr.minusHp((currentHp) => {
+                    if(currentHp <= 0) this.networkMgr.send({ type: 'game_over', status: 'fail' });
+                });
             }
         );
 
+        // 運行本地玩家移動物理
         this.playerMgr.update(
             this.keys, this.mapMgr.activePlatforms, this.canvas.height,
             (currentHp) => {
