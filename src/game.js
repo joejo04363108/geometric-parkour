@@ -11,8 +11,8 @@ class Game {
         this.isPlaying = false;
         this.username = "";
         this.roomId = "";
+        this.selectedLevel = 1; // 預設第一關
 
-        // 儲存所有人的開關狀態
         this.remoteSwitches1 = {};
         this.remoteSwitches2 = {};
 
@@ -26,7 +26,8 @@ class Game {
             playerList: document.getElementById('playerList'),
             roomTitle: document.getElementById('roomTitle'),
             btnStart: document.getElementById('btnStartGame'),
-            waitMsg: document.getElementById('waitHostMsg')
+            waitMsg: document.getElementById('waitHostMsg'),
+            lvl2Btn: document.getElementById('lvl2Btn') // 第二關按鈕
         };
 
         this.networkMgr = new NetworkManager(
@@ -36,6 +37,14 @@ class Game {
             () => this.startActualGame(),
             (res) => this.handleGameResult(res)
         );
+                // 綁定遠端關卡切換事件
+        this.networkMgr.onLevelChanged = (lvl) => {
+            this.selectedLevel = lvl;
+            document.querySelectorAll('.level-btn').forEach(b => {
+                b.classList.remove('active');
+                if (parseInt(b.getAttribute('data-level')) === lvl) b.classList.add('active');
+            });
+        };
 
         this.initUiEvents();
     }
@@ -65,13 +74,25 @@ class Game {
             this.networkMgr.connectRoom(this.roomId, this.username);
         };
 
+        // 監聽關卡選擇按鈕
+        document.querySelectorAll('.level-btn').forEach(btn => {
+            btn.onclick = (e) => {
+                // 只有房主能選關卡
+                document.querySelectorAll('.level-btn').forEach(b => b.classList.remove('active'));
+                e.target.classList.add('active');
+                this.selectedLevel = parseInt(e.target.getAttribute('data-level'));
+                this.networkMgr.send({ type: 'change_level', level: this.selectedLevel });
+            };
+        });
+
         this.doms.btnStart.onclick = () => {
             this.networkMgr.send({ type: 'start_game' });
         };
 
         window.addEventListener('keydown', e => {
             this.keys[e.code] = true;
-            if (this.isPlaying) this.playerMgr.handleKeyDown(e.code);
+            // 🔥 關鍵修正：將整個 keys 傳入，方便判定組合鍵 E + A/D
+            if (this.isPlaying) this.playerMgr.handleKeyDown(e.code, this.keys);
         });
         window.addEventListener('keyup', e => this.keys[e.code] = false);
     }
@@ -85,9 +106,17 @@ class Game {
             this.doms.playerList.appendChild(div);
         });
 
+        // 同步非房主的關卡外觀顯示
+        this.selectedLevel = info.level;
+        document.querySelectorAll('.level-btn').forEach(b => {
+            b.classList.remove('active');
+            if (parseInt(b.getAttribute('data-level')) === info.level) b.classList.add('active');
+        });
+
         if (info.host === this.username) {
             this.doms.btnStart.classList.remove('hidden');
             this.doms.waitMsg.classList.add('hidden');
+            this.doms.lvl2Btn.removeAttribute('disabled'); // 房主解鎖關卡選單
         } else {
             this.doms.btnStart.classList.add('hidden');
             this.doms.waitMsg.classList.remove('hidden');
@@ -97,10 +126,16 @@ class Game {
     startActualGame() {
         this.doms.room.classList.add('hidden');
         this.canvas.style.display = 'block';
-        this.mapMgr = new MapManager();
         
-        // 🛠️ 修正一：開始時強制重置血量、二段跳能力與位置
+        // 🔥 解決 Bug 1：強制清空所有按鍵狀態，防止自動走動
+        this.keys = {}; 
+        
+        this.mapMgr = new MapManager();
+        this.mapMgr.initLevel(this.selectedLevel);
+        
+        // 🔥 解決 Bug 2：確保玩家經理將血量完整重置為 3，Dash 與跳躍重置
         this.playerMgr.resetStatus(); 
+        
         this.remoteSwitches1 = {};
         this.remoteSwitches2 = {};
         
@@ -113,13 +148,13 @@ class Game {
         
         if (data.type === 'update') {
             this.playerMgr.updateRemote(id, data.x, data.y);
-            // 同步遠端玩家的兩個按鈕狀態
             if (data.sw1 !== undefined) this.remoteSwitches1[id] = data.sw1;
             if (data.sw2 !== undefined) this.remoteSwitches2[id] = data.sw2;
         }
         
-        if (data.type === 'interact' && data.action === 'item_collected') {
-            this.mapMgr.itemDoubleJump.collected = true;
+        if (data.type === 'interact') {
+            if (data.action === 'item_collected') this.mapMgr.itemDoubleJump.collected = true;
+            if (data.action === 'item_dash_collected') this.mapMgr.itemDash.collected = true;
         }
     }
 
@@ -130,6 +165,10 @@ class Game {
         
         if (res.status === 'success') {
             alert(`🏆 全隊過關！通關關卡: 第 ${res.level} 關\n⏱️ 全隊總耗時: ${res.time} 秒！`);
+            // 🔥 過第一關後，開啟第二關的選擇權限
+            if (res.level === 1) {
+                this.doms.lvl2Btn.removeAttribute('disabled');
+            }
         } else {
             alert(`❌ 挑戰失敗！有玩家生命值歸零。`);
         }
@@ -145,49 +184,53 @@ class Game {
     update() {
         let lp = this.playerMgr.localPlayer;
 
-        // 1. 判定本地玩家有沒有踩在按鈕一或按鈕二上
-        let mySw1 = this.mapMgr.checkOverlap(lp, this.mapMgr.switch1);
-        let mySw2 = this.mapMgr.checkOverlap(lp, this.mapMgr.switch2);
+        // 根據關卡抓取對應按鈕的重疊狀態
+        let mySw1 = false;
+        let mySw2 = false;
+        if (this.selectedLevel === 1) {
+            mySw1 = this.mapMgr.checkOverlap(lp, this.mapMgr.switch1);
+            mySw2 = this.mapMgr.checkOverlap(lp, this.mapMgr.switch2);
+        } else if (this.selectedLevel === 2) {
+            mySw1 = this.mapMgr.checkOverlap(lp, this.mapMgr.lvl2_btn1);
+            mySw2 = this.mapMgr.checkOverlap(lp, this.mapMgr.lvl2_btn2);
+        }
         
-        // 2. 整合房間內所有人的按鈕狀態
         let globalSw1 = mySw1;
         let globalSw2 = mySw2;
         for (let id in this.remoteSwitches1) if (this.remoteSwitches1[id]) globalSw1 = true;
         for (let id in this.remoteSwitches2) if (this.remoteSwitches2[id]) globalSw2 = true;
 
-        // 3. 運行地圖機關與碰撞
-        this.mapMgr.updateMechanics(globalSw1, globalSw2, lp, (evt) => {
-            this.networkMgr.send({ type: 'interact', action: 'item_collected' });
-        });
-
-        // 4. 運行本地玩家移動物理
-        this.playerMgr.update(
-            this.keys, this.mapMgr.activePlatforms, this.canvas.height,
-            (currentHp) => {
-                if(currentHp <= 0) {
-                    this.networkMgr.send({ type: 'game_over', status: 'fail' });
-                }
-            },
-            (x, y, hp) => {
-                // 傳送座標的同時，把兩個按鈕的狀態一起噴出去
-                this.networkMgr.send({ 
-                    type: 'update', x, y, hp, sw1: mySw1, sw2: mySw2 
-                });
+        // game.js 裡的 update() 內部修改：
+        this.mapMgr.updateMechanics(globalSw1, globalSw2, lp, 
+            this.playerMgr.remotePlayers, // 🔥 新增傳入遠端玩家清單
+            (evt) => {
+                if(evt.type === 'item_collected') this.networkMgr.send({ type: 'interact', action: 'item_collected' });
+                if(evt.type === 'item_dash_collected') this.networkMgr.send({ type: 'interact', action: 'item_dash_collected' });
             }
         );
 
-        // 🛠️ 修正二：核心通關邏輯——必須兩人都超越終點線才算過關
-        let amIGoal = lp.x >= this.mapMgr.goal.x;
+        this.playerMgr.update(
+            this.keys, this.mapMgr.activePlatforms, this.canvas.height,
+            (currentHp) => {
+                if(currentHp <= 0) this.networkMgr.send({ type: 'game_over', status: 'fail' });
+            },
+            (x, y, hp) => {
+                this.networkMgr.send({ type: 'update', x, y, hp, sw1: mySw1, sw2: mySw2 });
+            }
+        );
+
+        // 終點精準重疊判定
+        let amIGoal = this.mapMgr.checkOverlap(lp, this.mapMgr.goal);
         let everyoneGoal = amIGoal;
 
-        // 檢查是不是房間內的所有隊友也都過線了
         for (let id in this.playerMgr.remotePlayers) {
-            if (this.playerMgr.remotePlayers[id].x < this.mapMgr.goal.x) {
+            let rp = this.playerMgr.remotePlayers[id];
+            let remotePlayerRect = { x: rp.x, y: rp.y, width: lp.width, height: lp.height };
+            if (!this.mapMgr.checkOverlap(remotePlayerRect, this.mapMgr.goal)) {
                 everyoneGoal = false; 
             }
         }
 
-        // 只有在在線人數大於 0 且全員到齊時，才發送通關
         if (everyoneGoal && Object.keys(this.playerMgr.remotePlayers).length > 0) {
             this.networkMgr.send({ type: 'game_over', status: 'success' });
         }
